@@ -3,20 +3,21 @@ package mesosphere.marathon.state
 import java.io.{ ByteArrayInputStream, ObjectInputStream }
 import javax.inject.Inject
 
-import mesosphere.marathon.Protos.StorageVersion
+import mesosphere.marathon.Protos.{ MarathonApp, MarathonTask, StorageVersion }
 import mesosphere.marathon.metrics.Metrics
 import mesosphere.marathon.state.PathId._
 import mesosphere.marathon.state.StorageVersions._
-import mesosphere.marathon.tasks.TaskTracker
 import mesosphere.marathon.tasks.TaskTracker.InternalApp
 import mesosphere.marathon.{ BuildInfo, MarathonConf }
 import mesosphere.util.Logging
 import mesosphere.util.ThreadPoolContext.context
-import mesosphere.util.state.{ PersistentStoreManagement, PersistentEntity, PersistentStore }
+import mesosphere.util.state.{ PersistentStore, PersistentStoreManagement }
+import org.apache.log4j.Logger
 import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
 import scala.collection.SortedSet
+import scala.collection.concurrent.TrieMap
 import scala.concurrent.duration._
 import scala.concurrent.{ Await, Future }
 import scala.util.control.NonFatal
@@ -26,12 +27,15 @@ class Migration @Inject() (
     store: PersistentStore,
     appRepo: AppRepository,
     groupRepo: GroupRepository,
+    taskRepo: TaskRepository,
     config: MarathonConf,
     metrics: Metrics) extends Logging {
 
   //scalastyle:off magic.number
 
   type MigrationAction = (StorageVersion, () => Future[Any])
+
+  private[state] val minSupportedStorageVersion = StorageVersions(0, 3, 0)
 
   /**
     * All the migrations, that have to be applied.
@@ -54,10 +58,21 @@ class Migration @Inject() (
           case NonFatal(e) => throw new RuntimeException("while migrating storage to 0.11", e)
         }
       } yield ()
+    },
+    StorageVersions(0, 12, 0) -> { () =>
+      for {
+        _ <- new MigrationTo0_12(taskRepo).migrateTasks().recover {
+          case NonFatal(e) => throw new RuntimeException("while migrating storage to 0.12", e)
+        }
+      } yield ()
     }
   )
 
   def applyMigrationSteps(from: StorageVersion): Future[List[StorageVersion]] = {
+    if (from < minSupportedStorageVersion && from.nonEmpty) {
+      val msg = s"Migration from versions < $minSupportedStorageVersion is not supported. Your version: $from"
+      throw new RuntimeException(msg)
+    }
     val result = migrations.filter(_._1 > from).sortBy(_._1).map {
       case (migrateVersion, change) =>
         log.info(
@@ -116,11 +131,11 @@ class Migration @Inject() (
   }
 
   private def changeTasks(fn: InternalApp => InternalApp): Future[Any] = {
-    val taskTracker = new TaskTracker(store, config, metrics)
+    val LEGACY_PREFIX = "tasks:"
     def fetchApp(appId: PathId): Option[InternalApp] = {
-      Await.result(store.load("tasks:" + appId.safePath), config.zkTimeoutDuration).map { entity =>
+      Await.result(store.load(LEGACY_PREFIX + appId.safePath), config.zkTimeoutDuration).map { entity =>
         val source = new ObjectInputStream(new ByteArrayInputStream(entity.bytes.toArray))
-        val fetchedTasks = taskTracker.legacyDeserialize(appId, source).map {
+        val fetchedTasks = LegacyTaskMigrationHelper.legacyDeserialize(appId, source).map {
           case (key, task) =>
             val builder = task.toBuilder.clearOBSOLETEStatuses()
             task.getOBSOLETEStatusesList.asScala.lastOption.foreach(builder.setStatus)
@@ -129,8 +144,8 @@ class Migration @Inject() (
         new InternalApp(appId, fetchedTasks, false)
       }
     }
-    def storeApp(app: InternalApp): Future[Seq[PersistentEntity]] = {
-      Future.sequence(app.tasks.values.toSeq.map(taskTracker.store(app.appName, _)))
+    def storeApp(app: InternalApp): Future[Seq[MarathonTask]] = {
+      Future.sequence(app.tasks.values.toSeq.map(taskRepo.store))
     }
     appRepo.allPathIds().flatMap { apps =>
       val res = apps.flatMap(fetchApp).map{ app => storeApp(fn(app)) }
@@ -149,6 +164,37 @@ class Migration @Inject() (
       }
     }
   }
+}
+
+object LegacyTaskMigrationHelper {
+
+  private[this] val log = Logger.getLogger(getClass.getName)
+
+  def legacyDeserialize(appId: PathId, source: ObjectInputStream): TrieMap[String, MarathonTask] = {
+    val results = TrieMap[String, MarathonTask]()
+
+    if (source.available > 0) {
+      try {
+        val size = source.readInt
+        val bytes = new Array[Byte](size)
+        source.readFully(bytes)
+        val app = MarathonApp.parseFrom(bytes)
+        if (app.getName != appId.toString) {
+          log.warn(s"App name from task state for $appId is wrong!  Got '${app.getName}' Continuing anyway...")
+        }
+        results ++= app.getTasksList.asScala.map(x => x.getId -> x)
+      }
+      catch {
+        case e: com.google.protobuf.InvalidProtocolBufferException =>
+          log.warn(s"Unable to deserialize task state for $appId", e)
+      }
+    }
+    else {
+      log.warn(s"Unable to deserialize task state for $appId")
+    }
+    results
+  }
+
 }
 
 /**
@@ -244,6 +290,29 @@ class MigrationTo0_11(groupRepository: GroupRepository, appRepository: AppReposi
   }
 }
 
+class MigrationTo0_12(taskRepository: TaskRepository) {
+  private[this] val log = LoggerFactory.getLogger(getClass)
+
+  val entityStore = taskRepository.entityStore
+
+  def migrateTasks(): Future[Unit] = {
+    log.info("Start 0.12 migration")
+
+    def migrateKey(legacyKey: String): Future[Unit] = {
+      entityStore.fetch(legacyKey).flatMap {
+        case Some(taskState) => taskRepository.store(taskState.task).flatMap { _ =>
+          entityStore.expunge(legacyKey).map(_ => ())
+        }
+        case _ => Future.failed[Unit](new RuntimeException(s"Unable to load entity with key = $legacyKey"))
+      }
+    }
+
+    entityStore.names().flatMap { keys =>
+      Future.sequence(keys.map(migrateKey)).map(_ => ())
+    }
+  }
+}
+
 object StorageVersions {
   val VersionRegex = """^(\d+)\.(\d+)\.(\d+).*""".r
 
@@ -274,6 +343,8 @@ object StorageVersions {
     }
 
     def str: String = s"Version(${version.getMajor}, ${version.getMinor}, ${version.getPatch})"
+
+    def nonEmpty: Boolean = !version.equals(empty)
   }
 
   def empty: StorageVersion = StorageVersions(0, 0, 0)
